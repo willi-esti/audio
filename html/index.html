@@ -1,55 +1,306 @@
-<script>
-  const socket = new WebSocket("ws://192.168.255.14:8000");
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Transcription & Conversation</title>
+    <style>
+        body { font-family: sans-serif; }
+        #transcript { margin-top: 20px; border: 1px solid #ccc; padding: 10px; height: 200px; overflow-y: scroll; }
+        .user { color: blue; }
+        .ai { color: green; }
+        button { padding: 10px; font-size: 16px; }
+        #status { margin-top: 10px; color: gray; }
+    </style>
+</head>
+<body>
+    <h1>Real-time AI Conversation</h1>
+    <button id="startButton">Start Talking</button>
+    <button id="stopButton" disabled>Stop Talking</button>
+    <div id="status">Status: Idle</div>
+    <div id="transcript"></div>
 
-navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-  const mediaRecorder = new MediaRecorder(stream);
-  mediaRecorder.ondataavailable = event => {
-    if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-      socket.send(event.data);
-    }
-  };
-  mediaRecorder.start(1000); // send chunks every 1 second
-});
+    <script>
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const transcriptDiv = document.getElementById('transcript');
+        const statusDiv = document.getElementById('status');
 
-  /*
-    let socket;
-    let mediaRecorder;
-    
-    async function start() {
-      socket = new WebSocket("ws://192.168.255.14:8000");
-    
-      socket.onopen = async () => {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream, {
-          mimeType: "audio/ogg; codecs=opus",
-        });
-    
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-            event.data.arrayBuffer().then((buffer) => {
-              socket.send(buffer);
-            });
-          }
-        };
-    
-        mediaRecorder.start(250); // send every 250ms
-      };
-    
-      socket.onmessage = (msg) => {
-        console.log("Transcript:", msg.data);
-      };
-    
-      socket.onclose = () => {
-        console.log("Connection closed");
-      };
-    }
-    
-    function stop() {
-      mediaRecorder?.stop();
-      socket?.close();
-    }*/
+        const WEBSOCKET_URL = "ws://localhost:8000"; // Change if Python server is elsewhere
+        let socket;
+        let mediaRecorder;
+        let audioContext;
+        let audioQueue = [];
+        let nextStartTime = 0;
+        let isPlaying = false;
+        let userSpeaking = false;
+        let currentSourceNode = null; // Keep track of the currently playing audio source
+
+        // --- Audio Playback ---
+        function initializeAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000 // IMPORTANT: Match server TTS output rate
+                });
+                nextStartTime = audioContext.currentTime;
+                console.log("AudioContext initialized. Sample Rate:", audioContext.sampleRate);
+            }
+        }
+
+        function playAudioChunk(audioData) {
+            initializeAudio(); // Ensure context is ready
+
+            // audioData is expected to be ArrayBuffer containing raw PCM s16le
+             if (!(audioData instanceof ArrayBuffer)) {
+                console.error("Received data is not an ArrayBuffer:", audioData);
+                // If it's Blob, try to convert it
+                if (audioData instanceof Blob) {
+                    audioData.arrayBuffer().then(buffer => {
+                         playAudioChunk(buffer); // Retry with ArrayBuffer
+                    }).catch(e => console.error("Error converting Blob to ArrayBuffer:", e));
+                }
+                return;
+            }
+
+             console.log(`Received audio chunk size: ${audioData.byteLength} bytes`);
+
+             // Convert s16le raw PCM to Float32Array for Web Audio API
+             const pcmData = new Int16Array(audioData);
+             const floatData = new Float32Array(pcmData.length);
+             for (let i = 0; i < pcmData.length; i++) {
+                 floatData[i] = pcmData[i] / 32768.0; // Normalize to -1.0 to 1.0
+             }
+
+             if (floatData.length === 0) {
+                 console.warn("Received empty audio data after conversion.");
+                 return;
+             }
+
+             const audioBuffer = audioContext.createBuffer(
+                 1, // Number of channels (mono)
+                 floatData.length, // Buffer length
+                 audioContext.sampleRate // Sample rate
+             );
+
+             audioBuffer.copyToChannel(floatData, 0);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            // --- Queueing Logic ---
+            const currentTime = audioContext.currentTime;
+            // If next start time is in the past, reset it to now
+            if (nextStartTime < currentTime) {
+                nextStartTime = currentTime;
+                 console.log("Audio queue fell behind, resetting nextStartTime");
+            }
+
+            console.log(`Scheduling audio playback at: ${nextStartTime.toFixed(3)}s`);
+            source.start(nextStartTime);
+            isPlaying = true;
+            currentSourceNode = source; // Store the new source
+
+            // Calculate when this buffer will finish playing and schedule the next one
+            nextStartTime += audioBuffer.duration;
+
+            source.onended = () => {
+                console.log("Audio chunk finished playing.");
+                // Only set isPlaying false if this was the *last* scheduled node.
+                // This simple check might not be perfect for rapid chunks but is a start.
+                if (currentSourceNode === source) {
+                     isPlaying = false;
+                     currentSourceNode = null;
+                     console.log("Playback queue likely empty.");
+                     updateStatus();
+                }
+            };
+        }
+
+        function stopPlayback() {
+             if (currentSourceNode) {
+                console.log("Stopping current TTS playback.");
+                try {
+                    currentSourceNode.stop(); // Stop the currently playing node
+                } catch (e) {
+                    // Ignore errors if node already stopped or invalid state
+                     console.warn("Error stopping source node:", e.message);
+                }
+                currentSourceNode = null;
+            }
+            // Clear the queue and reset time (important!)
+            // We don't have a visible queue here, but conceptually reset the start time
+            if (audioContext) {
+                 nextStartTime = audioContext.currentTime;
+                 console.log("Resetting nextStartTime due to interruption.");
+            }
+            isPlaying = false;
+            updateStatus();
+        }
+
+
+        // --- WebSocket Communication ---
+        function connectWebSocket() {
+            socket = new WebSocket(WEBSOCKET_URL);
+
+            socket.onopen = () => {
+                console.log("WebSocket connected");
+                updateStatus();
+                startButton.disabled = false;
+            };
+
+            socket.onmessage = event => {
+                // Server sends raw audio bytes for TTS
+                 if (event.data instanceof Blob) {
+                     // If the server sends Blobs (less likely with current Python code)
+                     event.data.arrayBuffer().then(buffer => {
+                         playAudioChunk(buffer);
+                     }).catch(e => console.error("Error reading blob data:", e));
+                 } else if (event.data instanceof ArrayBuffer) {
+                     // If the server sends ArrayBuffers (also less likely directly)
+                    playAudioChunk(event.data);
+                 } else {
+                     // Most likely: WS receives Blob, gets converted here
+                     // Let's assume it's audio bytes if not JSON
+                    if (typeof event.data === 'object') { // Likely Blob
+                         event.data.arrayBuffer().then(buffer => {
+                            playAudioChunk(buffer);
+                        }).catch(e => console.error("Error reading received blob data:", e));
+                    } else {
+                         console.warn("Received unexpected message type:", typeof event.data, event.data);
+                         // Try to handle potential base64 encoded string if needed
+                         // try {
+                         //    const decoded = atob(event.data);
+                         //    const bytes = new Uint8Array(decoded.length);
+                         //    for (let i = 0; i < decoded.length; i++) {
+                         //        bytes[i] = decoded.charCodeAt(i);
+                         //    }
+                         //    playAudioChunk(bytes.buffer);
+                         // } catch (e) { console.error("Could not process message:", e); }
+                    }
+
+                 }
+            };
+
+            socket.onerror = error => {
+                console.error("WebSocket error:", error);
+                statusDiv.textContent = "Error connecting. Retrying...";
+                setTimeout(connectWebSocket, 5000); // Retry connection
+            };
+
+            socket.onclose = event => {
+                console.log("WebSocket closed:", event.reason, event.code);
+                updateStatus();
+                startButton.disabled = true;
+                stopButton.disabled = true;
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop();
+                }
+                 if (audioContext && audioContext.state !== 'closed') {
+                     audioContext.close().then(() => console.log("AudioContext closed."));
+                     audioContext = null; // Reset
+                 }
+                // Optionally try to reconnect
+                // statusDiv.textContent = "Connection closed. Retrying...";
+                // setTimeout(connectWebSocket, 5000);
+            };
+        }
+
+        // --- Media Recording ---
+        function startRecording() {
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                alert("WebSocket is not connected.");
+                return;
+            }
+
+            // --- Interruption ---
+            if (isPlaying) {
+                stopPlayback(); // Stop AI speech if user starts talking
+            }
+
+
+            navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+                .then(stream => {
+                    mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm;codecs=opus' // Standard WebM Opus
+                        // audioBitsPerSecond: 128000 // Optional: Adjust bitrate
+                    });
+
+                    mediaRecorder.ondataavailable = event => {
+                        if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+                            socket.send(event.data);
+                        }
+                    };
+
+                    mediaRecorder.onstart = () => {
+                         userSpeaking = true;
+                         updateStatus();
+                         startButton.disabled = true;
+                         stopButton.disabled = false;
+                         console.log("MediaRecorder started.");
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        userSpeaking = false;
+                        updateStatus();
+                        startButton.disabled = false;
+                        stopButton.disabled = true;
+                        // Clean up the stream tracks
+                        stream.getTracks().forEach(track => track.stop());
+                        console.log("MediaRecorder stopped.");
+                         // Small delay before potentially starting TTS playback again
+                         // nextStartTime = audioContext ? audioContext.currentTime + 0.1 : 0;
+                    };
+
+                    mediaRecorder.onerror = (event) => {
+                        console.error("MediaRecorder error:", event.error);
+                        alert(`MediaRecorder Error: ${event.error.name} - ${event.error.message}`);
+                        userSpeaking = false;
+                        updateStatus();
+                         startButton.disabled = false;
+                         stopButton.disabled = true;
+                    };
+
+                    mediaRecorder.start(1000); // Send chunks every 1 second
+
+                })
+                .catch(err => {
+                    console.error("Error getting user media:", err);
+                    alert(`Could not access microphone: ${err.name} - ${err.message}`);
+                    updateStatus();
+                });
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+        }
+
+        // --- UI Updates ---
+        function updateStatus() {
+            let statusText = "Idle";
+             if (socket && socket.readyState === WebSocket.OPEN) {
+                 statusText = "Connected";
+                 if (userSpeaking) {
+                     statusText = "Listening...";
+                 } else if (isPlaying) {
+                    statusText = "AI Speaking...";
+                 }
+             } else if (socket && socket.readyState === WebSocket.CONNECTING) {
+                 statusText = "Connecting...";
+             } else {
+                 statusText = "Disconnected";
+             }
+             statusDiv.textContent = `Status: ${statusText}`;
+        }
+
+        // --- Event Listeners ---
+        startButton.addEventListener('click', startRecording);
+        stopButton.addEventListener('click', stopRecording);
+
+        // --- Initial Connection ---
+        connectWebSocket();
+        updateStatus(); // Initial status update
+
     </script>
-    
-    <button onclick="start()">🎙️ Start</button>
-    <button onclick="stop()">🛑 Stop</button>
-    
+</body>
+</html>

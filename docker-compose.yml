@@ -6,3 +6,58 @@ services:
       - "8080:80"
     volumes:
       - ./html:/usr/local/apache2/htdocs/
+
+  ollama:
+    image: ollama/ollama:latest # Use the official Ollama image
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama # Persist models
+    # --- GPU Acceleration (Optional but Recommended) ---
+    # Uncomment the following if you have NVIDIA drivers and nvidia-container-toolkit installed
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1 # Or 'all'
+    #           capabilities: [gpu, compute, utility]
+    # --- End GPU Acceleration ---
+    pull_policy: always # Ensure you get updates, or set to 'if_not_present'
+    restart: unless-stopped
+
+  conversation_app:
+    container_name: conversation_app
+    build: . # Build from the Dockerfile in the current directory
+    ports:
+      - "8000:8000" # Expose WebSocket port
+    depends_on:
+      - ollama # Wait for Ollama to be available (basic check, might need wait script)
+    volumes:
+       # Mount TTS models cache to persist downloads (adjust path if needed)
+      - tts_models:/root/.local/share/tts
+      # Mount Whisper models cache
+      - whisper_models:/root/.cache/whisper
+    environment:
+      # Pass model names if needed, though they are hardcoded in app.py now
+      # - OLLAMA_MODEL=llama3
+      # - WHISPER_MODEL_NAME=base
+      # - TTS_MODEL_NAME=tts_models/en/ljspeech/tacotron2-DDC
+      - PYTHONUNBUFFERED=1 # Ensure logs appear immediately
+    # --- GPU Acceleration (Optional but Recommended for Whisper/TTS) ---
+    # Uncomment if Python app needs GPU (requires PyTorch with CUDA, etc.)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, compute, utility]
+    # --- End GPU Acceleration ---
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  tts_models:
+  whisper_models:
