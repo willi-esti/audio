@@ -1,0 +1,55 @@
+<script>
+  const socket = new WebSocket("ws://192.168.255.14:8000");
+
+navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+  const mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = event => {
+    if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+      socket.send(event.data);
+    }
+  };
+  mediaRecorder.start(1000); // send chunks every 1 second
+});
+
+  /*
+    let socket;
+    let mediaRecorder;
+    
+    async function start() {
+      socket = new WebSocket("ws://192.168.255.14:8000");
+    
+      socket.onopen = async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType: "audio/ogg; codecs=opus",
+        });
+    
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+            event.data.arrayBuffer().then((buffer) => {
+              socket.send(buffer);
+            });
+          }
+        };
+    
+        mediaRecorder.start(250); // send every 250ms
+      };
+    
+      socket.onmessage = (msg) => {
+        console.log("Transcript:", msg.data);
+      };
+    
+      socket.onclose = () => {
+        console.log("Connection closed");
+      };
+    }
+    
+    function stop() {
+      mediaRecorder?.stop();
+      socket?.close();
+    }*/
+    </script>
+    
+    <button onclick="start()">🎙️ Start</button>
+    <button onclick="stop()">🛑 Stop</button>
+    
